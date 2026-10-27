@@ -204,7 +204,7 @@ int main(int argc, char **argv) {
     if (options.release) return cache_release(options.archive, argv[0]);
 
     const int list = options.list;
-    const int use_cache = options.cache;
+    const int use_cache = options.cache && list;
     const int first_only = options.first;
     const char *archive = options.archive;
     const char *wanted = options.member;

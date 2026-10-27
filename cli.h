@@ -37,6 +37,7 @@ static void usage(FILE *out, const char *prog) {
         "Notes:\n"
         "  ARCHIVE may be .tar.gz, .tgz, or uncompressed .tar.\n"
         "  MEMBER writes file contents; --find/--first write filenames.\n"
+        "  --cache is accepted with MEMBER; extraction still reads the archive.\n"
         "  Cache is opt-in and stores filenames only, normally in ~/.cache/tgzcat/.\n"
         "  --first uses an existing cache; on a miss it stops early without building one.\n"
         "  Exit status: 0 success, 1 no match/I/O error, 2 invalid arguments.\n",
@@ -115,8 +116,8 @@ static int parse_options(int argc, char **argv, struct options *options) {
             return cli_error(argv[0], "--cache release accepts only an ARCHIVE path");
         return 0;
     }
-    if (options->member && (options->filter || explicit_list || options->cache))
-        return cli_error(argv[0], "MEMBER extraction cannot be combined with --list, --find, --first or --cache");
+    if (options->member && (options->filter || explicit_list))
+        return cli_error(argv[0], "MEMBER extraction cannot be combined with --list, --find or --first");
     options->list = options->member == NULL;
     return 0;
 }

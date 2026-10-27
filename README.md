@@ -44,7 +44,10 @@ full archive path. Duplicate names select the first match.
 | -- | Treat the remaining arguments as paths, including names starting with a dash. |
 
 --find=TEXT, --first=TEXT and --cache=release are also accepted.
-Do not combine MEMBER extraction with listing, search or cache options.
+Do not combine MEMBER extraction with listing or search options.
+--cache is accepted with MEMBER for convenience; extraction reads the archive
+directly, since the cache contains filenames and does not store file contents.
+For example, tgzcat I26283X.tar.gz I26283X.DRG --cache writes the DRG contents.
 A search with no matching names exits with status 1; argument errors exit with
 status 2. Running tgzcat without arguments, or with --help, writes the help and
 examples to standard output and exits successfully.

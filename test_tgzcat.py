@@ -241,6 +241,9 @@ def cli_checks(root):
     assert command(path, "--find", "").stdout == expected
     assert command(path, "--first=").stdout == b"dir/scan.cor\n"
     assert command(path, "scan.cor").stdout == entries[0][1]
+    assert command(path, "scan.cor", "--cache").stdout == entries[0][1]
+    assert command("-c", path, "experiment.DRG").stdout == b"schedule"
+    assert not cache_dir.exists(), "member extraction created a list cache"
     assert command(path, "--", "--list").stdout == b"literal member"
 
     dashed = work / "-input.tar.gz"
@@ -248,7 +251,7 @@ def cli_checks(root):
     assert command("--", "-input.tar.gz", cwd=work).stdout == expected
 
     invalid = [("--unknown", path), ("--find",), ("--first",), ("--cache", "release"),
-               (path, "scan.cor", "--list"), (path, "scan.cor", "--cache"),
+               (path, "scan.cor", "--list"),
                (path, "scan.cor", "--find", "scan"),
                (path, "--find", "scan", "--first", "scan"),
                (path, "--cache", "release", "--find", "scan"),
@@ -266,6 +269,9 @@ def cli_checks(root):
     assert command("--cache", "--first=scan", path).stdout == b"dir/scan.cor\n"
     assert command(path, "--find", "absent", "-c", check=False).returncode == 1
     assert command("-c", path).stdout == expected
+    assert command(path, "scan.cor", "-c").stdout == entries[0][1]
+    assert command("--cache", path, "experiment.DRG").stdout == b"schedule"
+    assert command(path, "missing.cor", "--cache", check=False).returncode == 1
     assert cached.stat().st_mtime_ns == stamp, "search rebuilt a valid cache"
     command(path, "--cache=release")
     assert not cached.exists()
