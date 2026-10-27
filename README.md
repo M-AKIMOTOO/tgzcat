@@ -46,12 +46,14 @@ full archive path. Duplicate names select the first match.
 --find=TEXT, --first=TEXT and --cache=release are also accepted.
 Do not combine MEMBER extraction with listing, search or cache options.
 A search with no matching names exits with status 1; argument errors exit with
-status 2. --help writes to standard output and exits successfully.
+status 2. Running tgzcat without arguments, or with --help, writes the help and
+examples to standard output and exits successfully.
 
 Examples:
 
 ```sh
 # Show the full help.
+tgzcat
 tgzcat --help
 
 # List every member of a tar.gz or tgz archive.

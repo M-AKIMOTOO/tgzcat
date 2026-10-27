@@ -53,6 +53,10 @@ static int cli_error(const char *prog, const char *message) {
 static int parse_options(int argc, char **argv, struct options *options) {
     int positional_only = 0, explicit_list = 0;
     memset(options, 0, sizeof *options);
+    if (argc == 1) {
+        usage(stdout, argv[0]);
+        return 1;
+    }
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!positional_only && strcmp(arg, "--") == 0) {

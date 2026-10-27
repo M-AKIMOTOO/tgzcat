@@ -226,7 +226,9 @@ def cli_checks(root):
         assert not help_result.stderr
         for text in [b"Usage:", b"Options", b"Examples:", b"--cache release", b"--first"]:
             assert text in help_result.stdout
-    assert command(check=False).returncode == 2
+    bare = command()
+    assert bare.stdout == command("--help").stdout
+    assert bare.stderr == b""
 
     for args in [(path,), ("--list", path), (path, "-l")]:
         assert command(*args).stdout == expected
