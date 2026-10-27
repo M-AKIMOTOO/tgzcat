@@ -34,20 +34,6 @@ struct tar_header {
     char pad[12];
 };
 
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage: %s ARCHIVE.tgz\n"
-        "       %s ARCHIVE.tgz MEMBER\n"
-        "\n"
-        "  one argument : list archive members\n"
-        "  --cache ARCHIVE.tgz: use a compressed filename cache\n"
-        "  ARCHIVE.tgz --cache release: remove only this archive cache\n"
-        "  --find TEXT ARCHIVE.tgz : list names containing TEXT\n"
-        "  --first TEXT ARCHIVE.tgz: list the first match and stop early\n"
-        "  two arguments: write MEMBER to stdout\n"
-        "                 (basename match if MEMBER contains no '/')\n",
-        prog, prog);
-}
 
 static int gzread_exact(gzFile gz, void *buf, size_t n) {
     unsigned char *p = buf;
@@ -208,48 +194,37 @@ static int write_payload(gzFile gz, uint64_t size, unsigned char *buf) {
 }
 
 #include "cache.h"
+#include "cli.h"
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
-    if (argc == 4 && strcmp(argv[2], "--cache") == 0 &&
-        strcmp(argv[3], "release") == 0) return cache_release(argv[1], argv[0]);
-    if (argc == 4 && strcmp(argv[1], "--cache") == 0 &&
-        strcmp(argv[2], "release") == 0) return cache_release(argv[3], argv[0]);
-    if (argc == 3 && strcmp(argv[1], "--cache") == 0 &&
-        strcmp(argv[2], "release") == 0) {
-        fprintf(stderr, "%s: --cache release requires an archive path\n", argv[0]);
-        return 2;
-    }
+    struct options options;
+    int parsed = parse_options(argc, argv, &options);
+    if (parsed != 0) return parsed > 0 ? 0 : 2;
+    if (options.release) return cache_release(options.archive, argv[0]);
 
-    const int filtered = argc == 4 &&
-        (strcmp(argv[1], "--find") == 0 || strcmp(argv[1], "--first") == 0);
-    if (argc != 2 && argc != 3 && !filtered) {
-        usage(argv[0]);
-        return 2;
-    }
-
-    const int use_cache = argc == 3 &&
-        (strcmp(argv[1], "--cache") == 0 || strcmp(argv[2], "--cache") == 0);
-    const int list = argc == 2 || use_cache || filtered;
-    const char *filter = filtered ? argv[2] : NULL;
-    const int first_only = filtered && strcmp(argv[1], "--first") == 0;
-    const char *archive = argv[filtered ? 3 :
-        (use_cache && strcmp(argv[1], "--cache") == 0 ? 2 : 1)];
-    const char *wanted = list ? NULL : argv[2];
-    const int basename_mode = (!list && strchr(wanted, '/') == NULL);
+    const int list = options.list;
+    const int use_cache = options.cache;
+    const int first_only = options.first;
+    const char *archive = options.archive;
+    const char *wanted = options.member;
+    const char *filter = options.filter;
+    const int basename_mode = wanted && strchr(wanted, '/') == NULL;
+    int found = 0;
 
     struct list_cache cache = {0};
     if (use_cache && cache_key(archive, &cache.key) == 0) {
         cache.path = cache_path_for(archive);
         if (cache.path) {
-            int hit = cache_read(&cache);
+            int hit = cache_read(&cache, filter, first_only, &found);
             if (hit) {
                 free(cache.path);
+                if (hit < 0 && errno == EPIPE) return 0;
                 if (hit < 0 && errno != EPIPE) {
                     fprintf(stderr, "%s: failed to read/write cached list\n", argv[0]);
                     return 1;
                 }
-                return 0;
+                return filter && !found ? 1 : 0;
             }
         }
     }
@@ -269,11 +244,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (cache.path) cache_begin(&cache);
+    if (cache.path && !first_only) cache_begin(&cache);
     unsigned char block[TAR_BLOCK];
     char *gnu_longname = NULL;
     char *pax_path = NULL;
-    int found = 0;
 
     for (;;) {
         int rr = gzread_exact(gz, block, TAR_BLOCK);
@@ -329,6 +303,7 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (cache.out) cache_add(&cache, path);
         if (list && (!filter || strstr(path, filter))) {
             if (puts(path) == EOF) {
                 int broken_pipe = errno == EPIPE;
@@ -341,7 +316,6 @@ int main(int argc, char **argv) {
                 return broken_pipe ? 0 : 1;
             }
             found = 1;
-            if (cache.out) cache_add(&cache, path);
             if (first_only) {
                 free(path);
                 break;

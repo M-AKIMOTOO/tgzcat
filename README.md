@@ -24,32 +24,82 @@ To build with GCC and system zlib only (no Rust toolchain):
     make BACKEND=zlib
     make install BACKEND=zlib
 
-List archive members, or write one member to standard output:
 
-    tgzcat observation.tar.gz
-    tgzcat observation.tar.gz directory/observation.cor
+Basic syntax (options may appear before or after the archive):
 
-A member name without a slash matches the basename; the first match is emitted.
-The fast reader handles concatenated gzip members and uncompressed tar inputs.
+    tgzcat ARCHIVE [MEMBER] [OPTIONS]
+
+With no MEMBER, list filenames. With MEMBER, write its binary contents to standard
+output. If MEMBER contains no slash, match its basename; otherwise match the
+full archive path. Duplicate names select the first match.
+
+| Option | Action |
+| --- | --- |
+| -h, --help | Show usage and examples; no archive needed. |
+| -l, --list | List filenames explicitly (the default without MEMBER). |
+| -f, --find TEXT | List names containing a literal, case-sensitive substring. |
+| -1, --first TEXT | List only the first matching name. |
+| -c, --cache | Use the compressed filename cache for listing or searching. |
+| --cache release | Remove only the specified archive cache. |
+| -- | Treat the remaining arguments as paths, including names starting with a dash. |
+
+--find=TEXT, --first=TEXT and --cache=release are also accepted.
+Do not combine MEMBER extraction with listing, search or cache options.
+A search with no matching names exits with status 1; argument errors exit with
+status 2. --help writes to standard output and exits successfully.
+
+Examples:
+
+```sh
+# Show the full help.
+tgzcat --help
+
+# List every member of a tar.gz or tgz archive.
+tgzcat I26282X.tar.gz
+tgzcat observation.tgz
+
+# Read a DRG text file without extracting it to disk (basename match).
+tgzcat I26282X.tar.gz I26282X.DRG | less
+
+# Extract a binary cor member to a file (full-path match).
+tgzcat I26282X.tar.gz I26282X/x/cor/scan.cor > scan.cor
+
+# List every filename containing this baseline name.
+tgzcat I26282X.tar.gz --find YAMAGU32_YAMAGU34
+
+# Print the first matching filename and stop early.
+tgzcat I26282X.tar.gz --first .DRG
+
+# Build or reuse a compressed list cache.
+tgzcat I26282X.tar.gz --cache
+
+# Search the cached list, building the complete list cache if necessary.
+tgzcat I26282X.tar.gz --cache --find YAMAGU32_YAMAGU34
+
+# The same search with short options or options first.
+tgzcat -c -f YAMAGU32_YAMAGU34 I26282X.tar.gz
+
+# Use grep when a regular expression, rather than a literal substring, is needed.
+tgzcat I26282X.tar.gz --cache | grep "YAMAGU32_YAMAGU34.*[.]cor$"
+
+# Remove only the cache belonging to this archive.
+tgzcat I26282X.tar.gz --cache release
+
+# Interpret a dash-prefixed filename as an archive, not an option.
+tgzcat -- -observation.tar.gz
+```
+
+MEMBER outputs file contents; --find and --first output filenames.
+The reader also handles concatenated gzip members and uncompressed .tar inputs.
 Complete listing scans validate the remaining gzip stream, including its CRC.
+Reaching a late member in gzip requires decompressing everything before it.
+--first and MEMBER extraction stop early and do not validate the unread remainder.
 
-Search filenames by a literal, case-sensitive substring:
-
-    tgzcat --find YAMAGU32_YAMAGU34 I26282X.tar.gz
-    tgzcat --first YAMAGU32_YAMAGU34 I26282X.tar.gz
-
---find lists every matching name. --first stops after the first match.
-A search with no matching names exits with status 1.
-The original form with grep still works.
-For gzip inputs, reaching a late member requires decompressing everything
-before it. --first and member extraction stop early and do not validate the
-unread remainder of the archive.
-
-
-List caching is opt-in and compressed. Both forms build or reuse the cache:
-
-    tgzcat --cache observation.tar.gz
-    tgzcat observation.tar.gz --cache
+Caching is opt-in and stores filenames only. --cache may be combined with
+--find or --first. A --find cache build stores the complete list, including
+names excluded by the filter. --first uses an existing cache; if none is valid,
+it searches the archive and stops early without creating an incomplete cache.
+Both the older options-first forms and archive-first forms remain supported.
 
 All new caches are stored in one directory, in this order of precedence:
 

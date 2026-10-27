@@ -105,8 +105,53 @@ static int cache_mkdir_parents(const char *file) {
     return 0;
 }
 
+struct cache_search {
+    const char *filter;
+    int first, found;
+    char *line;
+    size_t length, capacity;
+};
+
+/* Return 2 after the first match, 1 to continue, -1 on output/allocation failure. */
+static int cache_emit(struct cache_search *search, const unsigned char *data, size_t size) {
+    if (!search->filter) {
+        if (size && fwrite(data, 1, size, stdout) != size) return -1;
+        if (size) search->found = 1;
+        return 1;
+    }
+    while (size) {
+        const unsigned char *end = memchr(data, '\n', size);
+        size_t n = end ? (size_t)(end - data) + 1 : size;
+        if (n > SIZE_MAX - search->length - 1) { errno = ENOMEM; return -1; }
+        size_t needed = search->length + n + 1;
+        if (needed > search->capacity) {
+            size_t capacity = needed > SIZE_MAX / 2 ? needed : needed * 2;
+            char *line = realloc(search->line, capacity);
+            if (!line) return -1;
+            search->line = line;
+            search->capacity = capacity;
+        }
+        memcpy(search->line + search->length, data, n);
+        search->length += n;
+        search->line[search->length] = '\0';
+        data += n;
+        size -= n;
+        if (end) {
+            /* Exclude the separator from literal matching (TEXT may itself contain '\n'). */
+            search->line[search->length - 1] = '\0';
+            if (strstr(search->line, search->filter)) {
+                search->line[search->length - 1] = '\n';
+                if (fwrite(search->line, 1, search->length, stdout) != search->length) return -1;
+                search->found = 1;
+                if (search->first) return 2;
+            }
+            search->length = 0;
+        }
+    }
+    return 1;
+}
 /* Return 1 for a valid complete stream, 0 for corrupt input, -1 for output failure. */
-static int cache_decode(FILE *file, int emit) {
+static int cache_decode(FILE *file, struct cache_search *search) {
     z_stream stream = {0};
     if (inflateInit(&stream) != Z_OK) return 0;
     unsigned char in[8192], out[8192];
@@ -126,7 +171,11 @@ static int cache_decode(FILE *file, int emit) {
         stream.avail_out = sizeof out;
         int ret = inflate(&stream, Z_NO_FLUSH);
         size_t n = sizeof out - stream.avail_out;
-        if (emit && n && fwrite(out, 1, n, stdout) != n) { result = -1; break; }
+        if (search) {
+            int emitted = cache_emit(search, out, n);
+            if (emitted < 0) { result = -1; break; }
+            if (emitted == 2) { result = 1; break; }
+        }
         if (ret == Z_STREAM_END) {
             result = stream.avail_in == 0 && fgetc(file) == EOF && !ferror(file);
             break;
@@ -137,17 +186,20 @@ static int cache_decode(FILE *file, int emit) {
     return result;
 }
 
-static int cache_read(struct list_cache *cache) {
+static int cache_read(struct list_cache *cache, const char *filter, int first, int *found) {
     FILE *file = fopen(cache->path, "rb");
     if (!file) return 0;
     struct list_cache_key key;
     int result = 0;
     if (fread(&key, sizeof key, 1, file) == 1 &&
         memcmp(&key, &cache->key, sizeof key) == 0 &&
-        cache_decode(file, 0) == 1 &&
+        cache_decode(file, NULL) == 1 &&
         fseeko(file, sizeof key, SEEK_SET) == 0) {
         /* Verify first, then emit: a corrupt cache must not precede a fresh listing. */
-        result = cache_decode(file, 1);
+        struct cache_search search = {.filter = filter, .first = first};
+        result = cache_decode(file, &search);
+        *found = search.found;
+        free(search.line);
         if (!result) { errno = EIO; result = -1; }
         if (fflush(stdout) != 0) result = -1;
     }

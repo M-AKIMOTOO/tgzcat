@@ -23,7 +23,7 @@ endif
 all: tgzcat
 
 # Relink when switching BACKEND; the C compilation is small.
-tgzcat: tgzcat.c reader.h cache.h $(READER_LIB) FORCE
+tgzcat: tgzcat.c reader.h cache.h cli.h $(READER_LIB) FORCE
 	$(CC) $(CPPFLAGS) $(READER_CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(READER_LDFLAGS) -o $@ $< $(READER_LIBS) $(LDLIBS)
 
 target/release/libtgzcat_reader.a: Cargo.toml Cargo.lock reader.rs

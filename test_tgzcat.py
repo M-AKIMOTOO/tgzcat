@@ -16,8 +16,8 @@ import time
 BIN = str(Path(__file__).resolve().parent / "tgzcat")
 
 
-def run(*args, check=True, env=None):
-    return subprocess.run([BIN, *map(str, args)], capture_output=True, check=check, env=env)
+def run(*args, check=True, env=None, cwd=None):
+    return subprocess.run([BIN, *map(str, args)], capture_output=True, check=check, env=env, cwd=cwd)
 
 
 def archive(path, entries, fmt=tarfile.PAX_FORMAT):
@@ -205,6 +205,89 @@ def central_cache_checks(root):
     assert not list(root.rglob("*.tmp.*"))
     print("Central compressed cache checks passed; archive-specific release preserves other caches.")
 
+
+def cli_checks(root):
+    work = root / "cli"
+    work.mkdir()
+    path = work / "input.tar.gz"
+    cache_dir = work / "cache"
+    env = dict(os.environ, TGZCAT_CACHE_DIR=str(cache_dir))
+    entries = [("dir/scan.cor", b"binary\0data"), ("other/scan.cor", b"second"),
+               ("experiment.DRG", b"schedule"), ("--list", b"literal member")]
+    archive(path, entries)
+    expected = b"".join(name.encode() + b"\n" for name, _ in entries)
+    matches = b"dir/scan.cor\nother/scan.cor\n"
+
+    def command(*args, check=True, cwd=None):
+        return run(*args, check=check, env=env, cwd=cwd)
+
+    for flag in ["-h", "--help"]:
+        help_result = command(flag)
+        assert not help_result.stderr
+        for text in [b"Usage:", b"Options", b"Examples:", b"--cache release", b"--first"]:
+            assert text in help_result.stdout
+    assert command(check=False).returncode == 2
+
+    for args in [(path,), ("--list", path), (path, "-l")]:
+        assert command(*args).stdout == expected
+    for args in [("--find", "scan", path), (path, "--find", "scan"),
+                 ("-f", "scan", path), (path, "--find=scan")]:
+        assert command(*args).stdout == matches
+    for args in [("--first", "scan", path), (path, "--first", "scan"),
+                 ("-1", "scan", path), (path, "--first=scan")]:
+        assert command(*args).stdout == b"dir/scan.cor\n"
+    assert command(path, "--find", "").stdout == expected
+    assert command(path, "--first=").stdout == b"dir/scan.cor\n"
+    assert command(path, "scan.cor").stdout == entries[0][1]
+    assert command(path, "--", "--list").stdout == b"literal member"
+
+    dashed = work / "-input.tar.gz"
+    dashed.write_bytes(path.read_bytes())
+    assert command("--", "-input.tar.gz", cwd=work).stdout == expected
+
+    invalid = [("--unknown", path), ("--find",), ("--first",), ("--cache", "release"),
+               (path, "scan.cor", "--list"), (path, "scan.cor", "--cache"),
+               (path, "scan.cor", "--find", "scan"),
+               (path, "--find", "scan", "--first", "scan"),
+               (path, "--cache", "release", "--find", "scan"),
+               (path, "one", "two"), ("--cache=invalid", path)]
+    for args in invalid:
+        result = command(*args, check=False)
+        assert result.returncode == 2, args
+        assert result.stdout == b"" and b"--help" in result.stderr, args
+
+    # A filtered cache build must still cache every filename.
+    assert command(path, "-c", "-f", "scan").stdout == matches
+    cached, = cache_dir.glob("*.list.z")
+    assert zlib.decompress(cached.read_bytes()[64:]) == expected
+    stamp = cached.stat().st_mtime_ns
+    assert command("--cache", "--first=scan", path).stdout == b"dir/scan.cor\n"
+    assert command(path, "--find", "absent", "-c", check=False).returncode == 1
+    assert command("-c", path).stdout == expected
+    assert cached.stat().st_mtime_ns == stamp, "search rebuilt a valid cache"
+    command(path, "--cache=release")
+    assert not cached.exists()
+    assert command(path, "--first", "scan", "-c").stdout == b"dir/scan.cor\n"
+    assert not list(cache_dir.glob("*.list.z")), "early stop published an incomplete cache"
+    assert command("--find", "absent", path, "--cache", check=False).returncode == 1
+    assert command(path, "--cache").stdout == expected
+    command("--cache", "release", path)
+
+    # Cache filtering must handle names that span decompression buffers.
+    long_path = "long/" + "a" * 17000 + "/needle.cor"
+    archive(path, [(long_path, b""), ("last.cor", b"")])
+    expected_long = (long_path + "\nlast.cor\n").encode()
+    assert command(path, "--cache").stdout == expected_long
+    assert command(path, "--cache", "--find", "needle").stdout == (long_path + "\n").encode()
+    assert command("-c", "-1", "last", path).stdout == b"last.cor\n"
+    pipe = subprocess.Popen([BIN, str(path), "--cache", "--find", "needle"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    pipe.stdout.close()
+    assert pipe.wait(timeout=5) == 0, "closed downstream pipe should exit cleanly"
+    assert pipe.stderr.read() == b""
+    pipe.stderr.close()
+    command(path, "--cache", "release")
+    print("CLI checks passed: help, argument order, aliases, errors, '--', and cached searches.")
 def cache_benchmark(root, source):
     expected = run(source).stdout
     start = time.perf_counter()
@@ -270,6 +353,7 @@ if __name__ == "__main__":
         root = Path(directory)
         checks(root)
         central_cache_checks(root)
+        cli_checks(root)
         if len(sys.argv) > 1:
             benchmark(root, sys.argv[1])
             cache_benchmark(root, sys.argv[1])
