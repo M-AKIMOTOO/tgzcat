@@ -1,0 +1,424 @@
+#define _XOPEN_SOURCE 700
+#define _POSIX_C_SOURCE 200809L
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <zlib.h>
+#include <sys/stat.h>
+#include "reader.h"
+
+#define TAR_BLOCK 512
+#define IO_BUFSZ (1u << 20)
+
+struct tar_header {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char chksum[8];
+    char typeflag;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char pad[12];
+};
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s ARCHIVE.tgz\n"
+        "       %s ARCHIVE.tgz MEMBER\n"
+        "\n"
+        "  one argument : list archive members\n"
+        "  --cache ARCHIVE.tgz: use a compressed filename cache\n"
+        "  ARCHIVE.tgz --cache release: remove only this archive cache\n"
+        "  --find TEXT ARCHIVE.tgz : list names containing TEXT\n"
+        "  --first TEXT ARCHIVE.tgz: list the first match and stop early\n"
+        "  two arguments: write MEMBER to stdout\n"
+        "                 (basename match if MEMBER contains no '/')\n",
+        prog, prog);
+}
+
+static int gzread_exact(gzFile gz, void *buf, size_t n) {
+    unsigned char *p = buf;
+    size_t off = 0;
+    while (off < n) {
+        unsigned want = (unsigned)((n - off) > (size_t)0x7fffffff ? 0x7fffffff : (n - off));
+        int r = gzread(gz, p + off, want);
+        if (r < 0) return -1;
+        if (r == 0) {
+            int zerr = Z_OK;
+            (void)gzerror(gz, &zerr);
+            if (zerr != Z_OK && zerr != Z_STREAM_END) return -1;
+            return off == 0 ? 0 : -2;
+        }
+        off += (size_t)r;
+    }
+    return 1;
+}
+
+static int all_zero(const unsigned char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) if (p[i] != 0) return 0;
+    return 1;
+}
+
+static uint64_t parse_octal(const char *s, size_t n) {
+    uint64_t v = 0;
+    size_t i = 0;
+    while (i < n && (s[i] == ' ' || s[i] == '\0')) i++;
+    for (; i < n; i++) {
+        if (s[i] < '0' || s[i] > '7') break;
+        v = (v << 3) + (uint64_t)(s[i] - '0');
+    }
+    return v;
+}
+
+static char *header_path(const struct tar_header *h) {
+    size_t nl = strnlen(h->name, sizeof h->name);
+    size_t pl = strnlen(h->prefix, sizeof h->prefix);
+    size_t len = nl + (pl ? pl + 1 : 0);
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    if (pl) {
+        memcpy(out, h->prefix, pl);
+        out[pl] = '/';
+        memcpy(out + pl + 1, h->name, nl);
+    } else {
+        memcpy(out, h->name, nl);
+    }
+    out[len] = '\0';
+    return out;
+}
+
+static const char *base_name(const char *p) {
+    const char *s = strrchr(p, '/');
+    return s ? s + 1 : p;
+}
+
+static int skip_bytes(gzFile gz, uint64_t n, unsigned char *buf) {
+#ifdef TGZCAT_FAST_READER
+    (void)buf;
+    return fast_gzskip(gz, n);
+#else
+    while (n) {
+        unsigned chunk = (unsigned)(n > IO_BUFSZ ? IO_BUFSZ : n);
+        int r = gzread(gz, buf, chunk);
+        if (r <= 0) return -1;
+        n -= (uint64_t)r;
+    }
+    return 0;
+#endif
+}
+
+static int finish_stream(gzFile gz, unsigned char *buf) {
+#ifdef TGZCAT_FAST_READER
+    (void)buf;
+    return fast_gzfinish(gz);
+#else
+    int r;
+    do { r = gzread(gz, buf, IO_BUFSZ); } while (r > 0);
+    if (r < 0) return -1;
+    int code = Z_OK;
+    (void)gzerror(gz, &code);
+    return code == Z_OK || code == Z_STREAM_END ? 0 : -1;
+#endif
+}
+static char *read_payload_string(gzFile gz, uint64_t size, unsigned char *buf) {
+    if (size > SIZE_MAX - 1) return NULL;
+    char *s = malloc((size_t)size + 1);
+    if (!s) return NULL;
+    uint64_t left = size;
+    size_t off = 0;
+    while (left) {
+        unsigned chunk = (unsigned)(left > IO_BUFSZ ? IO_BUFSZ : left);
+        int r = gzread(gz, s + off, chunk);
+        if (r <= 0) { free(s); return NULL; }
+        off += (size_t)r;
+        left -= (uint64_t)r;
+    }
+    s[off] = '\0';
+    if (off && s[off - 1] == '\0') {
+        /* GNU longname usually includes trailing NUL. */
+    } else {
+        while (off && (s[off - 1] == '\n' || s[off - 1] == '\r')) s[--off] = '\0';
+    }
+    uint64_t pad = (TAR_BLOCK - (size % TAR_BLOCK)) % TAR_BLOCK;
+    if (pad && skip_bytes(gz, pad, buf) != 0) { free(s); return NULL; }
+    return s;
+}
+
+static char *pax_path_value(const char *data, size_t len) {
+    size_t pos = 0;
+    char *found = NULL;
+    while (pos < len) {
+        char *endp;
+        errno = 0;
+        long rec_len = strtol(data + pos, &endp, 10);
+        if (errno || endp == data + pos || rec_len <= 0) break;
+        size_t rl = (size_t)rec_len;
+        if (rl > len - pos) break;
+        const char *rec = data + pos;
+        const char *space = memchr(rec, ' ', rl);
+        if (!space) break;
+        const char *kv = space + 1;
+        size_t kvlen = rl - (size_t)(kv - rec);
+        if (kvlen && kv[kvlen - 1] == '\n') kvlen--;
+        const char key[] = "path=";
+        if (kvlen >= sizeof(key) - 1 && memcmp(kv, key, sizeof(key) - 1) == 0) {
+            free(found);
+            found = malloc(kvlen - (sizeof(key) - 1) + 1);
+            if (!found) return NULL;
+            size_t vl = kvlen - (sizeof(key) - 1);
+            memcpy(found, kv + sizeof(key) - 1, vl);
+            found[vl] = '\0';
+        }
+        pos += rl;
+    }
+    return found;
+}
+
+static int write_payload(gzFile gz, uint64_t size, unsigned char *buf) {
+    while (size) {
+        unsigned chunk = (unsigned)(size > IO_BUFSZ ? IO_BUFSZ : size);
+        int r = gzread(gz, buf, chunk);
+        if (r <= 0) return -1;
+        size_t off = 0;
+        while (off < (size_t)r) {
+            ssize_t w = write(STDOUT_FILENO, buf + off, (size_t)r - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EPIPE) return 1;
+                return -1;
+            }
+            off += (size_t)w;
+        }
+        size -= (uint64_t)r;
+    }
+    return 0;
+}
+
+#include "cache.h"
+
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+    if (argc == 4 && strcmp(argv[2], "--cache") == 0 &&
+        strcmp(argv[3], "release") == 0) return cache_release(argv[1], argv[0]);
+    if (argc == 4 && strcmp(argv[1], "--cache") == 0 &&
+        strcmp(argv[2], "release") == 0) return cache_release(argv[3], argv[0]);
+    if (argc == 3 && strcmp(argv[1], "--cache") == 0 &&
+        strcmp(argv[2], "release") == 0) {
+        fprintf(stderr, "%s: --cache release requires an archive path\n", argv[0]);
+        return 2;
+    }
+
+    const int filtered = argc == 4 &&
+        (strcmp(argv[1], "--find") == 0 || strcmp(argv[1], "--first") == 0);
+    if (argc != 2 && argc != 3 && !filtered) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    const int use_cache = argc == 3 &&
+        (strcmp(argv[1], "--cache") == 0 || strcmp(argv[2], "--cache") == 0);
+    const int list = argc == 2 || use_cache || filtered;
+    const char *filter = filtered ? argv[2] : NULL;
+    const int first_only = filtered && strcmp(argv[1], "--first") == 0;
+    const char *archive = argv[filtered ? 3 :
+        (use_cache && strcmp(argv[1], "--cache") == 0 ? 2 : 1)];
+    const char *wanted = list ? NULL : argv[2];
+    const int basename_mode = (!list && strchr(wanted, '/') == NULL);
+
+    struct list_cache cache = {0};
+    if (use_cache && cache_key(archive, &cache.key) == 0) {
+        cache.path = cache_path_for(archive);
+        if (cache.path) {
+            int hit = cache_read(&cache);
+            if (hit) {
+                free(cache.path);
+                if (hit < 0 && errno != EPIPE) {
+                    fprintf(stderr, "%s: failed to read/write cached list\n", argv[0]);
+                    return 1;
+                }
+                return 0;
+            }
+        }
+    }
+    gzFile gz = gzopen(archive, "rb");
+    if (!gz) {
+        cache_end(&cache, archive, 0);
+        fprintf(stderr, "%s: cannot open '%s'\n", argv[0], archive);
+        return 1;
+    }
+    gzbuffer(gz, IO_BUFSZ);
+
+    unsigned char *buf = malloc(IO_BUFSZ);
+    if (!buf) {
+        fprintf(stderr, "%s: out of memory\n", argv[0]);
+        cache_end(&cache, archive, 0);
+        gzclose(gz);
+        return 1;
+    }
+
+    if (cache.path) cache_begin(&cache);
+    unsigned char block[TAR_BLOCK];
+    char *gnu_longname = NULL;
+    char *pax_path = NULL;
+    int found = 0;
+
+    for (;;) {
+        int rr = gzread_exact(gz, block, TAR_BLOCK);
+        if (rr == 0) break;
+        if (rr < 0) {
+            int zerr = 0;
+            const char *msg = gzerror(gz, &zerr);
+            fprintf(stderr, "%s: truncated/corrupt archive%s%s\n",
+                    argv[0], msg && *msg ? ": " : "", msg && *msg ? msg : "");
+            goto fail;
+        }
+        if (all_zero(block, TAR_BLOCK)) break;
+
+        struct tar_header h;
+        memcpy(&h, block, TAR_BLOCK);
+        uint64_t size = parse_octal(h.size, sizeof h.size);
+        char type = h.typeflag ? h.typeflag : '0';
+
+        if (type == 'L') {
+            free(gnu_longname);
+            gnu_longname = read_payload_string(gz, size, buf);
+            if (!gnu_longname) {
+                fprintf(stderr, "%s: failed to read GNU longname\n", argv[0]);
+                goto fail;
+            }
+            continue;
+        }
+
+        if (type == 'x') {
+            char *pax = read_payload_string(gz, size, buf);
+            if (!pax) {
+                fprintf(stderr, "%s: failed to read PAX header\n", argv[0]);
+                goto fail;
+            }
+            free(pax_path);
+            pax_path = pax_path_value(pax, (size_t)size);
+            free(pax);
+            continue;
+        }
+
+        char *path = NULL;
+        if (pax_path) {
+            path = pax_path;
+            pax_path = NULL;
+        } else if (gnu_longname) {
+            path = gnu_longname;
+            gnu_longname = NULL;
+        } else {
+            path = header_path(&h);
+            if (!path) {
+                fprintf(stderr, "%s: out of memory\n", argv[0]);
+                goto fail;
+            }
+        }
+
+        if (list && (!filter || strstr(path, filter))) {
+            if (puts(path) == EOF) {
+                int broken_pipe = errno == EPIPE;
+                free(path);
+                cache_end(&cache, archive, 0);
+                free(gnu_longname);
+                free(pax_path);
+                free(buf);
+                gzclose(gz);
+                return broken_pipe ? 0 : 1;
+            }
+            found = 1;
+            if (cache.out) cache_add(&cache, path);
+            if (first_only) {
+                free(path);
+                break;
+            }
+        }
+
+        int is_regular = (type == '0' || type == '7');
+        int match = 0;
+        if (!list && is_regular) {
+            match = basename_mode ? strcmp(base_name(path), wanted) == 0
+                                  : strcmp(path, wanted) == 0;
+        }
+
+        if (match) {
+            found = 1;
+            int wr = write_payload(gz, size, buf);
+            if (wr < 0) {
+                fprintf(stderr, "%s: read/write error while extracting '%s'\n", argv[0], path);
+                free(path);
+                goto fail;
+            }
+            free(path);
+            free(gnu_longname);
+            free(pax_path);
+            free(buf);
+            gzclose(gz);
+            return 0;
+        }
+
+        if (skip_bytes(gz, size, buf) != 0) {
+            fprintf(stderr, "%s: truncated/corrupt payload for '%s'\n", argv[0], path);
+            free(path);
+            goto fail;
+        }
+        uint64_t pad = (TAR_BLOCK - (size % TAR_BLOCK)) % TAR_BLOCK;
+        if (pad && skip_bytes(gz, pad, buf) != 0) {
+            fprintf(stderr, "%s: truncated/corrupt padding after '%s'\n", argv[0], path);
+            free(path);
+            goto fail;
+        }
+
+        free(path);
+    }
+
+    if (list && !(first_only && found) && finish_stream(gz, buf) != 0) {
+        int zerr;
+        fprintf(stderr, "%s: corrupt/truncated gzip stream: %s\n",
+                argv[0], gzerror(gz, &zerr));
+        goto fail;
+    }
+    if (list && fflush(stdout) != 0) {
+        int broken_pipe = errno == EPIPE;
+        cache_end(&cache, archive, 0);
+        free(gnu_longname);
+        free(pax_path);
+        free(buf);
+        gzclose(gz);
+        return broken_pipe ? 0 : 1;
+    }
+    cache_end(&cache, archive, 1);
+    if (!list && !found) {
+        fprintf(stderr, "%s: '%s' not found in '%s'\n", argv[0], wanted, archive);
+        goto fail;
+    }
+
+    free(gnu_longname);
+    free(pax_path);
+    free(buf);
+    gzclose(gz);
+    return filter && !found ? 1 : 0;
+
+fail:
+    cache_end(&cache, archive, 0);
+    free(gnu_longname);
+    free(pax_path);
+    free(buf);
+    gzclose(gz);
+    return 1;
+}
+

@@ -1,0 +1,6 @@
+/tgzcat
+/target/
+__pycache__/
+*.py[cod]
+*.tgzcat-list
+*.tgzcat-list.tmp.*
