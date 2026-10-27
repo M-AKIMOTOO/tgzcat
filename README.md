@@ -1,158 +1,183 @@
 # tgzcat
 
 List members of tar.gz/tgz archives or stream a selected member to standard output.
-Supports GNU/PAX long names, substring searches and an optional compressed list cache.
-
-Requires GCC, make, and zlib development headers/libraries. The default fast build
-also requires Rust/Cargo; tests require Python 3.
+Supports GNU/PAX long names, substring searches, and compressed caches for both
+listing and indexed extraction.
 
 Build and install to $HOME/bin:
 
     make
     make install
 
-The C main program is compiled with GCC. By default a streaming reader using
-flate2 and zlib-rs is built with Rust/Cargo and linked statically. Dependencies
-are pinned in Cargo.lock. Initial builds may download these two dependencies;
-later offline builds work with make CARGO_FLAGS=--offline.
-The fast reader uses 256 KiB input and 1 MiB output buffers and does not retain
-the full archive in RAM. Unselected payloads are consumed directly from the
-output buffer without copying them to another buffer.
-
-To build with GCC and system zlib only (no Rust toolchain):
+Requires GCC, make, and zlib development headers/libraries. The default fast
+reader also requires Rust/Cargo. Dependencies are pinned in Cargo.lock; after
+the first build, make CARGO_FLAGS=--offline works without network access.
+To build with GCC and system zlib only:
 
     make BACKEND=zlib
     make install BACKEND=zlib
 
+The C program uses flate2/zlib-rs for ordinary streaming reads in the fast build.
+Index construction and indexed extraction use zlib block boundaries, bit priming,
+and dictionary restoration in both builds.
 
 Basic syntax (options may appear before or after the archive):
 
     tgzcat ARCHIVE [MEMBER] [OPTIONS]
 
-With no MEMBER, list filenames. With MEMBER, write its binary contents to standard
-output. If MEMBER contains no slash, match its basename; otherwise match the
-full archive path. Duplicate names select the first match.
+Without MEMBER, list filenames. With MEMBER, write its contents to standard
+output. A name without a slash matches the basename; otherwise it matches the
+full archive path. If names repeat, the first regular-file match is extracted.
 
 | Option | Action |
 | --- | --- |
-| -h, --help | Show usage and examples; no archive needed. |
+| -h, --help | Show usage and examples; running without arguments does the same. |
 | -l, --list | List filenames explicitly (the default without MEMBER). |
 | -f, --find TEXT | List names containing a literal, case-sensitive substring. |
 | -1, --first TEXT | List only the first matching name. |
-| -c, --cache | Use the compressed filename cache for listing or searching. |
-| --cache release | Remove only the specified archive cache. |
-| -- | Treat the remaining arguments as paths, including names starting with a dash. |
+| -c, --cache | Use or build compressed caches for listing and extraction. |
+| --cache release | Remove only the specified archive caches. |
+| -v, --verbose | Report cache hits, index building, and extraction restart positions to stderr. |
+| -- | Treat remaining arguments as paths, including names starting with a dash. |
 
 --find=TEXT, --first=TEXT and --cache=release are also accepted.
-Do not combine MEMBER extraction with listing or search options.
---cache is accepted with MEMBER for convenience; extraction reads the archive
-directly, since the cache contains filenames and does not store file contents.
-For example, tgzcat I26283X.tar.gz I26283X.DRG --cache writes the DRG contents.
-A search with no matching names exits with status 1; argument errors exit with
-status 2. Running tgzcat without arguments, or with --help, writes the help and
-examples to standard output and exits successfully.
+MEMBER extraction may use --cache, but cannot be combined with --list, --find
+or --first. --find/--first output filenames, not file contents.
+Exit status is 0 for success, 1 for no match or an I/O error, and 2 for invalid
+arguments. Help is written to standard output.
 
 Examples:
 
 ```sh
-# Show the full help.
+# Show help and examples.
 tgzcat
-tgzcat --help
 
-# List every member of a tar.gz or tgz archive.
-tgzcat I26282X.tar.gz
-tgzcat observation.tgz
+# List all archive members.
+tgzcat I26283X.tar.gz
 
-# Read a DRG text file without extracting it to disk (basename match).
-tgzcat I26282X.tar.gz I26282X.DRG | less
+# Read a DRG text file without creating an extracted file.
+tgzcat I26283X.tar.gz I26283X.DRG | less
 
-# Extract a binary cor member to a file (full-path match).
-tgzcat I26282X.tar.gz I26282X/x/cor/scan.cor > scan.cor
+# Extract a cor file using its full archive path.
+tgzcat observation.tgz experiment/cor/scan.cor > scan.cor
 
-# List every filename containing this baseline name.
-tgzcat I26282X.tar.gz --find YAMAGU32_YAMAGU34
+# Search names, or stop after the first matching name.
+tgzcat I26283X.tar.gz --find YAMAGU32_YAMAGU34
+tgzcat I26283X.tar.gz --first .DRG
 
-# Print the first matching filename and stop early.
-tgzcat I26282X.tar.gz --first .DRG
+# First full scan builds a filename cache and an extraction index.
+tgzcat I26283X.tar.gz --cache > /dev/null
 
-# Build or reuse a compressed list cache.
-tgzcat I26282X.tar.gz --cache
+# Repeated extraction seeks near the member; verbose shows the restart offset.
+tgzcat I26283X.tar.gz I26283X.DRG --cache --verbose
 
-# Search the cached list, building the complete list cache if necessary.
-tgzcat I26282X.tar.gz --cache --find YAMAGU32_YAMAGU34
+# An extraction can also build the index on its first invocation.
+tgzcat observation.tgz scan.cor --cache > scan.cor
 
-# The same search with short options or options first.
-tgzcat -c -f YAMAGU32_YAMAGU34 I26282X.tar.gz
+# Search the cached list; short options and options-first syntax also work.
+tgzcat I26283X.tar.gz --cache --find YAMAGU32_YAMAGU34
+tgzcat -c -f YAMAGU32_YAMAGU34 I26283X.tar.gz
 
-# Use grep when a regular expression, rather than a literal substring, is needed.
-tgzcat I26282X.tar.gz --cache | grep "YAMAGU32_YAMAGU34.*[.]cor$"
+# Use grep when a regular expression is needed.
+tgzcat I26283X.tar.gz --cache | grep "YAMAGU32_YAMAGU34.*[.]cor$"
 
-# Remove only the cache belonging to this archive.
-tgzcat I26282X.tar.gz --cache release
+# Remove this archive's list, index, and abandoned cache temporary files.
+tgzcat I26283X.tar.gz --cache release
 
-# Interpret a dash-prefixed filename as an archive, not an option.
+# A dash-prefixed archive name.
 tgzcat -- -observation.tar.gz
 ```
 
-MEMBER outputs file contents; --find and --first output filenames.
-The reader also handles concatenated gzip members and uncompressed .tar inputs.
-Complete listing scans validate the remaining gzip stream, including its CRC.
-Reaching a late member in gzip requires decompressing everything before it.
---first and MEMBER extraction stop early and do not validate the unread remainder.
+Without --cache, the archive is read sequentially and no cache is created.
+With --cache, the first full scan records every member's name, payload offset
+and size, plus restartable DEFLATE positions about every 16 MiB of uncompressed
+data. Restart points are at eligible block boundaries, so gaps can be larger.
+Each point stores a compressed-file offset, bit count, and up to 32 KiB of history.
 
-Caching is opt-in and stores filenames only. --cache may be combined with
---find or --first. A --find cache build stores the complete list, including
-names excluded by the filter. --first uses an existing cache; if none is valid,
-it searches the archive and stops early without creating an incomplete cache.
-Both the older options-first forms and archive-first forms remain supported.
+Later extraction reads the compressed index, locates the first matching member,
+seeks the archive near that member, restores the history and bits, and decompresses
+only the gap and requested contents. It does not decompress from the archive start.
+Plain .tar files use direct byte offsets without DEFLATE dictionaries.
+Concatenated gzip members are supported, including requests crossing their boundaries.
 
-All new caches are stored in one directory, in this order of precedence:
+A first extraction with --cache continues scanning after emitting the requested
+file so it can finish and validate the index. It can therefore take longer than
+an uncached extraction on that first call. Subsequent calls reuse the index.
+--first uses an existing cache but stops early without building one on a miss.
+A filtered --find cache build still records all names and members.
+
+Caches are opt-in and use one directory, in this precedence order:
 
 - TGZCAT_CACHE_DIR, if set
 - $XDG_CACHE_HOME/tgzcat, if XDG_CACHE_HOME is an absolute path
 - $HOME/.cache/tgzcat
 
-Each archive has one <path-hash>.list.z file. Its canonical absolute path
-determines the name, so archives with identical basenames remain separate,
-symlink aliases share a cache, and replacing an archive overwrites its old cache.
-The file contains a 64-byte metadata header followed by a zlib-compressed list.
-Only filenames are stored. Device, inode, size, modification and change times
-are checked before reuse. The compressed stream is verified before output;
-a truncated or corrupt cache is rebuilt without duplicating the listing.
-Compression/decompression uses bounded buffers.
+Each archive can have two files sharing the hash of its canonical absolute path:
 
-Remove only the specified archive cache:
+- <path-hash>.list.z: small zlib-compressed filename list, with a 64-byte metadata header.
+- <path-hash>.index.gz: gzip-compressed member positions and restart dictionaries.
+
+The index contains metadata and short decompression histories, not copies of
+complete member contents. Its size grows with the number of checkpoints:
+roughly 32 KiB per 16 MiB before compression, plus member metadata.
+Readers use fixed-size buffers and retain only a few checkpoints at a time;
+index construction streams checkpoints to disk rather than keeping all in RAM.
+If a filename cache is missing, it can be recreated from a valid extraction index
+without scanning the archive again.
+
+Archives with the same basename in different directories have separate caches.
+Symlink aliases share a cache. Replacing an archive overwrites the corresponding
+cache paths. Device, inode, size, modification time and change time are checked
+before reuse. Compressed indexes are validated before extraction starts.
+Whole-archive gzip CRCs are checked during index construction. Indexed extraction
+relies on unchanged archive metadata and does not rescan the archive to recheck
+the whole-stream CRC. Uncached extraction and --first also stop before validating
+the unread remainder.
+
+Old filename-only caches are upgraded automatically on the next full --cache
+invocation. Corrupt or outdated caches are rebuilt. If cache creation is not
+possible, ordinary scanning/extraction still works.
+
+Release is archive-specific and idempotent:
 
     tgzcat observation.tar.gz --cache release
     tgzcat --cache release observation.tar.gz
 
-Release also removes abandoned temporary files for that archive. It preserves
-other archives, unrelated files and the cache directory. Repeating release is
-safe when the selected cache is absent. A bare tgzcat --cache release is rejected;
-there is no command that clears all archive caches.
-A recognized .tgzcat-list file from earlier versions alongside the specified
-archive is also removed. Old sidecars are not automatically migrated or scanned
-globally. New caches are published by atomic rename; interrupted builds may
-leave a temporary file which release can remove.
-If a cache cannot be written, ordinary listing still works.
+It removes that archive's list, index and their temporary files, preserving other
+archives, unrelated files and the cache directory. A bare tgzcat --cache release
+is rejected. A recognized legacy .tgzcat-list beside the specified archive is
+also removed; there is no global cache deletion command.
 
-Run behavior checks with make check (or make check BACKEND=zlib).
-They cover extraction, GNU/PAX long names, buffer boundaries, concatenated
-gzip members, checksum errors, plain tar inputs, filters and cache behavior.
+Run tests (Python 3 required):
 
-To measure scanning and compressed-cache use (test caches stay in a temporary directory):
+    make check
+    make check BACKEND=zlib
+
+Checks cover GNU/PAX names, duplicate basenames, zero-length members, non-byte-aligned
+restart points, dictionary restoration, concatenated gzip streams, corrupt indexes,
+source invalidation, broken pipes, and sparse tar offsets beyond 4 GiB.
+
+To measure a real archive (test caches stay in a temporary directory):
 
     make check ARCHIVE=/path/to/observation.tar.gz
     make check ARCHIVE=/path/to/observation.tar.gz BASELINE=/path/to/old-tgzcat
 
-Timing uses the median of three runs and reports peak RSS with /usr/bin/time.
-On I26282X.tar.gz (349 MiB, 733 names), the measured listing time changed from
-1.55 s to 0.98 s, and late-member extraction from 1.72 s to 1.07 s.
-Peak RSS changed from about 5.5 MiB to 2.9 MiB. Results depend on input and host.
-For that archive, the filename list is 60,903 bytes; the compressed cache is
-3,388 bytes including metadata (4,096 bytes allocated on the tested filesystem).
-Cache hits took about 0.0011 s. Sizes depend on the filename list and filesystem.
+On I26283X.tar.gz (220 MiB, 691 names), medians of three runs were:
 
-Third-party source and licenses:
+| Extraction | Uncached | Indexed |
+| --- | ---: | ---: |
+| I26283X.DRG | 0.680 s | 0.014 s |
+| late YAMAGU32_YAMAGU34 cor (1.2 MiB) | 0.707 s | 0.011 s |
+
+The initial cache build took 1.34 s. Storage was 3,013 bytes for the list plus
+427,852 bytes for the index (22 checkpoints), about 421 KiB total. Indexed peak
+RSS was about 3.3-3.5 MiB. Sizes and timings depend on archive contents and host.
+
+Third-party sources and licenses:
+
 - https://github.com/rust-lang/flate2-rs (LICENSE.flate2-MIT / LICENSE.flate2-APACHE)
 - https://github.com/trifectatechfoundation/zlib-rs (LICENSE.zlib-rs)
+- https://github.com/madler/zlib/blob/master/examples/zran.c (checkpoint algorithm; LICENSE.zran)
+
+The checkpoint reader in seek_index.h is a streaming adaptation of the zran
+approach; it does not retain an array of all decompression dictionaries.

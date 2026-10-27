@@ -3,7 +3,7 @@
 
 struct options {
     const char *archive, *member, *filter;
-    int list, cache, release, first;
+    int list, cache, release, first, verbose;
 };
 
 static void usage(FILE *out, const char *prog) {
@@ -20,9 +20,10 @@ static void usage(FILE *out, const char *prog) {
         "  -l, --list           List names explicitly (the default without MEMBER).\n"
         "  -f, --find TEXT      List names containing TEXT (literal, case-sensitive).\n"
         "  -1, --first TEXT     List only the first name containing TEXT.\n"
-        "  -c, --cache          Use a compressed filename cache for listing/search.\n"
+        "  -c, --cache          Cache names and seek positions for listing/search/extraction.\n"
         "      --cache release  Remove only the specified archive's cache.\n"
         "  -h, --help           Show this help and examples.\n"
+        "  -v, --verbose        Report cache hits and extraction restart positions.\n"
         "      --               Treat remaining arguments as paths, even if they start '-'.\n"
         "\n"
         "Examples:\n"
@@ -37,8 +38,8 @@ static void usage(FILE *out, const char *prog) {
         "Notes:\n"
         "  ARCHIVE may be .tar.gz, .tgz, or uncompressed .tar.\n"
         "  MEMBER writes file contents; --find/--first write filenames.\n"
-        "  --cache is accepted with MEMBER; extraction still reads the archive.\n"
-        "  Cache is opt-in and stores filenames only, normally in ~/.cache/tgzcat/.\n"
+        "  --cache builds an index on the first full scan; later extractions seek near MEMBER.\n"
+        "  Cache is opt-in; compressed lists and restart dictionaries live in ~/.cache/tgzcat/.\n"
         "  --first uses an existing cache; on a miss it stops early without building one.\n"
         "  Exit status: 0 success, 1 no match/I/O error, 2 invalid arguments.\n",
         prog, prog, prog, prog, prog, prog, prog, prog);
@@ -67,6 +68,10 @@ static int parse_options(int argc, char **argv, struct options *options) {
         if (!positional_only && (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0)) {
             usage(stdout, argv[0]);
             return 1;
+        }
+        if (!positional_only && (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0)) {
+            options->verbose = 1;
+            continue;
         }
         if (!positional_only && (strcmp(arg, "-l") == 0 || strcmp(arg, "--list") == 0)) {
             explicit_list = 1;

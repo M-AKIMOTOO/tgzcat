@@ -89,6 +89,15 @@ static char *cache_path_for(const char *archive) {
     return path;
 }
 
+static char *cache_index_path_for(const char *archive) {
+    char *list = cache_path_for(archive);
+    if (!list) return NULL;
+    size_t n = strlen(list);
+    char *path = malloc(n + 3);
+    if (path) snprintf(path, n + 3, "%.*s.index.gz", (int)(n - 7), list);
+    free(list);
+    return path;
+}
 static int cache_mkdir_parents(const char *file) {
     char *path = strdup(file);
     if (!path) return -1;
@@ -284,6 +293,9 @@ static int cache_release(const char *archive, const char *prog) {
     *slash = '\0';
     const char *name = slash + 1;
     size_t len = strlen(name);
+    char index_name[64];
+    snprintf(index_name, sizeof index_name, "%.*s.index.gz", (int)(len - 7), name);
+    size_t index_len = strlen(index_name);
     size_t removed = 0;
     int result = 0;
     DIR *dir = opendir(path);
@@ -291,9 +303,13 @@ static int cache_release(const char *archive, const char *prog) {
         struct dirent *entry;
         errno = 0;
         while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, name) != 0 &&
-                !(strncmp(entry->d_name, name, len) == 0 &&
-                  strncmp(entry->d_name + len, ".tmp.", 5) == 0)) continue;
+            int selected_list = strcmp(entry->d_name, name) == 0 ||
+                (strncmp(entry->d_name, name, len) == 0 &&
+                 strncmp(entry->d_name + len, ".tmp.", 5) == 0);
+            int selected_index = strcmp(entry->d_name, index_name) == 0 ||
+                (strncmp(entry->d_name, index_name, index_len) == 0 &&
+                 strncmp(entry->d_name + index_len, ".tmp.", 5) == 0);
+            if (!selected_list && !selected_index) continue;
             if (unlinkat(dirfd(dir), entry->d_name, 0) == 0) removed++;
             else if (errno != ENOENT) { result = 1; break; }
             errno = 0;

@@ -1,3 +1,4 @@
+#define _FILE_OFFSET_BITS 64
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
@@ -13,6 +14,8 @@
 
 #define TAR_BLOCK 512
 #define IO_BUFSZ (1u << 20)
+#include "cache.h"
+#include "seek_index.h"
 
 struct tar_header {
     char name[100];
@@ -35,16 +38,16 @@ struct tar_header {
 };
 
 
-static int gzread_exact(gzFile gz, void *buf, size_t n) {
+static int archive_read_exact(struct archive_reader *gz, void *buf, size_t n) {
     unsigned char *p = buf;
     size_t off = 0;
     while (off < n) {
         unsigned want = (unsigned)((n - off) > (size_t)0x7fffffff ? 0x7fffffff : (n - off));
-        int r = gzread(gz, p + off, want);
+        int r = archive_read(gz, p + off, want);
         if (r < 0) return -1;
         if (r == 0) {
             int zerr = Z_OK;
-            (void)gzerror(gz, &zerr);
+            (void)archive_error(gz, &zerr);
             if (zerr != Z_OK && zerr != Z_STREAM_END) return -1;
             return off == 0 ? 0 : -2;
         }
@@ -91,35 +94,19 @@ static const char *base_name(const char *p) {
     return s ? s + 1 : p;
 }
 
-static int skip_bytes(gzFile gz, uint64_t n, unsigned char *buf) {
-#ifdef TGZCAT_FAST_READER
-    (void)buf;
-    return fast_gzskip(gz, n);
-#else
-    while (n) {
-        unsigned chunk = (unsigned)(n > IO_BUFSZ ? IO_BUFSZ : n);
-        int r = gzread(gz, buf, chunk);
-        if (r <= 0) return -1;
-        n -= (uint64_t)r;
-    }
-    return 0;
-#endif
+static int skip_bytes(struct archive_reader *gz, uint64_t n, unsigned char *buf) {
+    return archive_skip(gz, n, buf);
 }
 
-static int finish_stream(gzFile gz, unsigned char *buf) {
-#ifdef TGZCAT_FAST_READER
-    (void)buf;
-    return fast_gzfinish(gz);
-#else
-    int r;
-    do { r = gzread(gz, buf, IO_BUFSZ); } while (r > 0);
-    if (r < 0) return -1;
+static int finish_stream(struct archive_reader *gz, unsigned char *buf) {
+    int ret;
+    do { ret = archive_read(gz, buf, IO_BUFSZ); } while (ret > 0);
+    if (ret < 0) return -1;
     int code = Z_OK;
-    (void)gzerror(gz, &code);
+    (void)archive_error(gz, &code);
     return code == Z_OK || code == Z_STREAM_END ? 0 : -1;
-#endif
 }
-static char *read_payload_string(gzFile gz, uint64_t size, unsigned char *buf) {
+static char *read_payload_string(struct archive_reader *gz, uint64_t size, unsigned char *buf) {
     if (size > SIZE_MAX - 1) return NULL;
     char *s = malloc((size_t)size + 1);
     if (!s) return NULL;
@@ -127,7 +114,7 @@ static char *read_payload_string(gzFile gz, uint64_t size, unsigned char *buf) {
     size_t off = 0;
     while (left) {
         unsigned chunk = (unsigned)(left > IO_BUFSZ ? IO_BUFSZ : left);
-        int r = gzread(gz, s + off, chunk);
+        int r = archive_read(gz, s + off, chunk);
         if (r <= 0) { free(s); return NULL; }
         off += (size_t)r;
         left -= (uint64_t)r;
@@ -173,10 +160,10 @@ static char *pax_path_value(const char *data, size_t len) {
     return found;
 }
 
-static int write_payload(gzFile gz, uint64_t size, unsigned char *buf) {
+static int write_payload(struct archive_reader *gz, uint64_t size, unsigned char *buf) {
     while (size) {
         unsigned chunk = (unsigned)(size > IO_BUFSZ ? IO_BUFSZ : size);
-        int r = gzread(gz, buf, chunk);
+        int r = archive_read(gz, buf, chunk);
         if (r <= 0) return -1;
         size_t off = 0;
         while (off < (size_t)r) {
@@ -193,7 +180,6 @@ static int write_payload(gzFile gz, uint64_t size, unsigned char *buf) {
     return 0;
 }
 
-#include "cache.h"
 #include "cli.h"
 
 int main(int argc, char **argv) {
@@ -204,7 +190,7 @@ int main(int argc, char **argv) {
     if (options.release) return cache_release(options.archive, argv[0]);
 
     const int list = options.list;
-    const int use_cache = options.cache && list;
+    const int use_cache = options.cache;
     const int first_only = options.first;
     const char *archive = options.archive;
     const char *wanted = options.member;
@@ -213,11 +199,41 @@ int main(int argc, char **argv) {
     int found = 0;
 
     struct list_cache cache = {0};
-    if (use_cache && cache_key(archive, &cache.key) == 0) {
+    struct index_builder index = {0};
+    struct index_match selected;
+    int index_status = use_cache ?
+        index_lookup(archive, wanted, wanted ? &selected : NULL) : 0;
+    if (!list && index_status == 2) {
+        if (options.verbose) fprintf(stderr, "%s: index hit; member is absent\n", argv[0]);
+        fprintf(stderr, "%s: \x27%s\x27 not found in \x27%s\x27\n", argv[0], wanted, archive);
+        return 1;
+    }
+    if (!list && index_status == 1) {
+        struct archive_reader *input = archive_open(archive, NULL, &selected);
+        if (input) {
+            if (options.verbose) fprintf(stderr,
+                "%s: index hit; compressed offset=%" PRIu64 ", uncompressed offset=%" PRIu64
+                ", skip=%" PRIu64 ", member bytes=%" PRIu64 "\n", argv[0],
+                selected.gzip ? selected.point.disk.in : selected.offset,
+                selected.gzip ? selected.point.disk.out : selected.offset,
+                selected.gzip ? selected.offset - selected.point.disk.out : 0, selected.size);
+            unsigned char *data = malloc(IO_BUFSZ);
+            if (!data) { archive_close(input); return 1; }
+            int ret = write_payload(input, selected.size, data);
+            free(data);
+            archive_close(input);
+            if (ret < 0) fprintf(stderr, "%s: indexed extraction failed for %s\n", argv[0], wanted);
+            return ret < 0 ? 1 : 0;
+        }
+        index_status = 0;
+    }
+    if (use_cache && list && cache_key(archive, &cache.key) == 0) {
         cache.path = cache_path_for(archive);
         if (cache.path) {
-            int hit = cache_read(&cache, filter, first_only, &found);
+            int hit = first_only || index_status == 1 ?
+                cache_read(&cache, filter, first_only, &found) : 0;
             if (hit) {
+                if (options.verbose && hit > 0) fprintf(stderr, "%s: list cache hit\n", argv[0]);
                 free(cache.path);
                 if (hit < 0 && errno == EPIPE) return 0;
                 if (hit < 0 && errno != EPIPE) {
@@ -228,19 +244,34 @@ int main(int argc, char **argv) {
             }
         }
     }
-    gzFile gz = gzopen(archive, "rb");
+    if (use_cache && list && index_status == 1) {
+        if (cache.path && !first_only) cache_begin(&cache);
+        struct index_listing listing = {.cache = &cache, .filter = filter, .first = first_only};
+        int ret = index_scan(archive, NULL, NULL, &listing);
+        if (fflush(stdout) != 0) ret = -1;
+        int broken_pipe = errno == EPIPE;
+        cache_end(&cache, archive, ret == 1);
+        if (ret != 1) return broken_pipe ? 0 : 1;
+        if (options.verbose) fprintf(stderr, "%s: listing from extraction index\n", argv[0]);
+        return filter && !listing.found ? 1 : 0;
+    }
+    if (use_cache && !first_only && index_status == 0) index_begin(&index, archive);
+    const int building = index.cache.out && index.cache.encoding && !index.cache.failed;
+    if (options.verbose && building) fprintf(stderr, "%s: building extraction index (full archive scan)\n", argv[0]);
+    struct archive_reader *gz = archive_open(archive, building ? &index : NULL, NULL);
     if (!gz) {
         cache_end(&cache, archive, 0);
+        index_end(&index, archive, 0, 0);
         fprintf(stderr, "%s: cannot open '%s'\n", argv[0], archive);
         return 1;
     }
-    gzbuffer(gz, IO_BUFSZ);
 
     unsigned char *buf = malloc(IO_BUFSZ);
     if (!buf) {
         fprintf(stderr, "%s: out of memory\n", argv[0]);
         cache_end(&cache, archive, 0);
-        gzclose(gz);
+        index_end(&index, archive, 0, 0);
+        archive_close(gz);
         return 1;
     }
 
@@ -250,11 +281,11 @@ int main(int argc, char **argv) {
     char *pax_path = NULL;
 
     for (;;) {
-        int rr = gzread_exact(gz, block, TAR_BLOCK);
+        int rr = archive_read_exact(gz, block, TAR_BLOCK);
         if (rr == 0) break;
         if (rr < 0) {
             int zerr = 0;
-            const char *msg = gzerror(gz, &zerr);
+            const char *msg = archive_error(gz, &zerr);
             fprintf(stderr, "%s: truncated/corrupt archive%s%s\n",
                     argv[0], msg && *msg ? ": " : "", msg && *msg ? msg : "");
             goto fail;
@@ -303,16 +334,18 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (building) index_add_member(&index, path, gz->position, size, type);
         if (cache.out) cache_add(&cache, path);
         if (list && (!filter || strstr(path, filter))) {
             if (puts(path) == EOF) {
                 int broken_pipe = errno == EPIPE;
                 free(path);
                 cache_end(&cache, archive, 0);
+                index_end(&index, archive, 0, 0);
                 free(gnu_longname);
                 free(pax_path);
                 free(buf);
-                gzclose(gz);
+                archive_close(gz);
                 return broken_pipe ? 0 : 1;
             }
             found = 1;
@@ -324,7 +357,7 @@ int main(int argc, char **argv) {
 
         int is_regular = (type == '0' || type == '7');
         int match = 0;
-        if (!list && is_regular) {
+        if (!list && !found && is_regular) {
             match = basename_mode ? strcmp(base_name(path), wanted) == 0
                                   : strcmp(path, wanted) == 0;
         }
@@ -333,19 +366,23 @@ int main(int argc, char **argv) {
             found = 1;
             int wr = write_payload(gz, size, buf);
             if (wr < 0) {
-                fprintf(stderr, "%s: read/write error while extracting '%s'\n", argv[0], path);
+                fprintf(stderr, "%s: read/write error while extracting %s\n", argv[0], path);
                 free(path);
                 goto fail;
             }
-            free(path);
-            free(gnu_longname);
-            free(pax_path);
-            free(buf);
-            gzclose(gz);
-            return 0;
+            if (!building || wr > 0) {
+                free(path);
+                cache_end(&cache, archive, 0);
+                index_end(&index, archive, 0, 0);
+                free(gnu_longname);
+                free(pax_path);
+                free(buf);
+                archive_close(gz);
+                return 0;
+            }
         }
 
-        if (skip_bytes(gz, size, buf) != 0) {
+        if (!match && skip_bytes(gz, size, buf) != 0) {
             fprintf(stderr, "%s: truncated/corrupt payload for '%s'\n", argv[0], path);
             free(path);
             goto fail;
@@ -360,22 +397,24 @@ int main(int argc, char **argv) {
         free(path);
     }
 
-    if (list && !(first_only && found) && finish_stream(gz, buf) != 0) {
+    if ((list || building) && !(first_only && found) && finish_stream(gz, buf) != 0) {
         int zerr;
         fprintf(stderr, "%s: corrupt/truncated gzip stream: %s\n",
-                argv[0], gzerror(gz, &zerr));
+                argv[0], archive_error(gz, &zerr));
         goto fail;
     }
     if (list && fflush(stdout) != 0) {
         int broken_pipe = errno == EPIPE;
         cache_end(&cache, archive, 0);
+        index_end(&index, archive, 0, 0);
         free(gnu_longname);
         free(pax_path);
         free(buf);
-        gzclose(gz);
+        archive_close(gz);
         return broken_pipe ? 0 : 1;
     }
     cache_end(&cache, archive, 1);
+    index_end(&index, archive, building, gz->position);
     if (!list && !found) {
         fprintf(stderr, "%s: '%s' not found in '%s'\n", argv[0], wanted, archive);
         goto fail;
@@ -384,15 +423,16 @@ int main(int argc, char **argv) {
     free(gnu_longname);
     free(pax_path);
     free(buf);
-    gzclose(gz);
+    archive_close(gz);
     return filter && !found ? 1 : 0;
 
 fail:
     cache_end(&cache, archive, 0);
+    index_end(&index, archive, 0, 0);
     free(gnu_longname);
     free(pax_path);
     free(buf);
-    gzclose(gz);
+    archive_close(gz);
     return 1;
 }
 

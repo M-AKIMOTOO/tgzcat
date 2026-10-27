@@ -15,6 +15,9 @@ static inline int fast_gzbuffer(fast_gzFile reader, unsigned size) {
     (void)size;
     return 0;
 }
+#ifdef gzopen
+#undef gzopen
+#endif
 #define gzFile fast_gzFile
 #define gzopen fast_gzopen
 #define gzread fast_gzread
